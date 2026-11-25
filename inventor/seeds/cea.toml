@@ -1,0 +1,26 @@
+# Seed: controlled-environment agriculture (greenhouses, vertical farms, hydroponics).
+# Queries per source. Plain topic words work best: the inventor lenses do the problem-finding,
+# so the queries only need to land in the right neighbourhood.
+name = "cea"
+description = "Controlled-environment agriculture: greenhouses, vertical farms, hydroponics, indoor growing"
+
+[queries]
+hackernews = [
+    "greenhouse automation",
+    "hydroponics",
+    "vertical farming",
+    "indoor farming",
+    "grow tent controller",
+]
+github_issues = [
+    "greenhouse",
+    "hydroponics",
+    "hydroponic controller",
+    "grow tent",
+]
+openalex = [
+    "greenhouse climate control",
+    "vertical farming challenges",
+    "controlled environment agriculture",
+    "hydroponic nutrient sensing",
+]

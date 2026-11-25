@@ -1,0 +1,10 @@
+# Harvested data and LLM caches never go in git.
+runs/
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+.DS_Store

@@ -1,0 +1,48 @@
+[project]
+name = "inventor"
+version = "0.1.0"
+description = "Find real problems worth solving: harvest friction from papers, forums, issues and startups, read it through an inventor's lens, and keep only what the evidence supports."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28,<1",
+    "pydantic>=2.10,<3",
+]
+
+[project.optional-dependencies]
+# Claude via the Anthropic API instead of the Claude Code CLI.
+api = ["anthropic>=2,<3"]
+# Deep-dive reports with GPT-Researcher (slice 3).
+deep = ["gpt-researcher>=0.17,<0.18"]
+# Tracing, monitoring scores and eval experiments in Langfuse (self-hosted or cloud).
+observe = [
+    "langfuse>=5.2,<6",
+]
+
+[project.scripts]
+inventor = "inventor.cli:main"
+
+[dependency-groups]
+dev = [
+    "langfuse>=5.2,<6",
+    "pytest>=9",
+    "ruff>=0.17",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["inventor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
