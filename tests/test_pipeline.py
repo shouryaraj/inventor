@@ -2,10 +2,11 @@ import asyncio
 import json
 from datetime import UTC, datetime
 
+import httpx
 from conftest import FakeBackend, json_transport
 
 from inventor.llm import Budget, LLMClient
-from inventor.pipeline import RunConfig, Seed, run
+from inventor.pipeline import RunConfig, Seed, redact, run
 
 HN = {"hits": [
     {"objectID": "1",
@@ -62,3 +63,43 @@ def test_budget_exhaustion_gives_partial_run_not_crash(tmp_path):
     result = asyncio.run(run(cfg, llm, transport=json_transport({"hn.algolia.com": HN})))
     assert result.stats.partial and "call cap" in result.stats.partial
     assert "Partial run" in (result.run_dir / "report.md").read_text()
+
+
+def test_harvest_errors_never_include_query_strings(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENALEX_API_KEY", "SECRET123")
+    cfg = RunConfig(seed=Seed("test", "", {"openalex": ["greenhouse"]}), sources=["openalex"], out_dir=tmp_path)
+    transport = httpx.MockTransport(lambda request: httpx.Response(500, request=request))
+    result = asyncio.run(run(cfg, LLMClient(FakeBackend(respond), Budget(1.0, 10)), transport=transport))
+    assert result.stats.harvest_errors and "500" in result.stats.harvest_errors[0]
+    assert "SECRET123" not in (result.run_dir / "report.md").read_text()
+    assert "SECRET123" not in redact("for url 'https://api.openalex.org/works?api_key=SECRET123&x=1'")
+
+
+def test_bad_source_response_is_recorded_not_fatal(tmp_path):
+    cfg = RunConfig(seed=Seed("test", "", {"hackernews": ["hydroponics"]}), sources=["hackernews"], out_dir=tmp_path)
+    broken = {"hits": [{"comment_text": "no objectID here, the record is malformed"}]}
+    result = asyncio.run(run(cfg, LLMClient(FakeBackend(respond), Budget(1.0, 10)),
+                             transport=json_transport({"hn.algolia.com": broken})))
+    assert result.stats.harvest_errors and "KeyError" in result.stats.harvest_errors[0]
+    assert (result.run_dir / "report.md").exists()
+
+
+def test_malformed_model_output_fails_the_batch_not_the_run(tmp_path):
+    def bad(request):
+        if "problems" in json.dumps(request.schema):
+            return {"problems": [{"signal_id": "hackernews:1"}]}  # required fields missing
+        return {"groups": []}
+
+    cfg = RunConfig(seed=Seed("test", "", {"hackernews": ["hydroponics"]}), sources=["hackernews"], out_dir=tmp_path)
+    result = asyncio.run(run(cfg, LLMClient(FakeBackend(bad), Budget(1.0, 10)),
+                             transport=json_transport({"hn.algolia.com": HN})))
+    assert result.stats.extract_errors and "extraction schema" in result.stats.extract_errors[0]
+    assert (result.run_dir / "report.md").exists()
+
+
+def test_runs_in_the_same_second_do_not_overwrite(tmp_path):
+    now = datetime(2026, 11, 25, tzinfo=UTC)
+    cfg = RunConfig(seed=Seed("test", "", {"hackernews": ["hydroponics"]}), sources=["hackernews"], out_dir=tmp_path)
+    dirs = {asyncio.run(run(cfg, LLMClient(FakeBackend(respond), Budget(1.0, 10)),
+                            transport=json_transport({"hn.algolia.com": HN}), now=now)).run_dir for _ in range(2)}
+    assert len(dirs) == 2

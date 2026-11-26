@@ -25,7 +25,6 @@ class ClaudeCLIBackend:
     def __init__(self, executable: str = "claude", timeout_s: float = 300.0) -> None:
         self.executable = executable
         self.timeout_s = timeout_s
-        self._workdir = tempfile.mkdtemp(prefix="inventor-llm-")
 
     def _args(self, request: LLMRequest) -> list[str]:
         args = [
@@ -43,13 +42,18 @@ class ClaudeCLIBackend:
         return args
 
     async def complete(self, request: LLMRequest) -> LLMResult:
+        with tempfile.TemporaryDirectory(prefix="inventor-llm-") as workdir:
+            stdout, stderr, returncode = await self._run(request, workdir)
+        return self._parse(request, stdout, stderr, returncode)
+
+    async def _run(self, request: LLMRequest, workdir: str) -> tuple[bytes, bytes, int | None]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._args(request),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=self._workdir,
+                cwd=workdir,
             )
         except FileNotFoundError as exc:
             raise LLMError(
@@ -61,14 +65,18 @@ class ClaudeCLIBackend:
             proc.kill()
             await proc.wait()
             raise LLMError(f"claude CLI timed out after {self.timeout_s:.0f} s") from exc
+        return stdout, stderr, proc.returncode
+
+    def _parse(self, request: LLMRequest, stdout: bytes, stderr: bytes, returncode: int | None) -> LLMResult:
 
         try:
             out = json.loads(stdout)
         except json.JSONDecodeError as exc:
             detail = (stderr or stdout).decode(errors="replace")[:500]
-            raise LLMError(f"claude CLI returned non-JSON output (exit {proc.returncode}): {detail}") from exc
+            raise LLMError(f"claude CLI returned non-JSON output (exit {returncode}): {detail}") from exc
+        cost = float(out.get("total_cost_usd") or 0.0)
         if out.get("is_error") or out.get("subtype") != "success":
-            raise LLMError(f"claude CLI error: {str(out.get('result'))[:500]}")
+            raise LLMError(f"claude CLI error: {str(out.get('result'))[:500]}", cost_usd=cost)
 
         text = out.get("result") or ""
         data = None
@@ -78,12 +86,12 @@ class ClaudeCLIBackend:
                 try:
                     data = json.loads(text)
                 except json.JSONDecodeError as exc:
-                    raise LLMError("structured output requested but none returned") from exc
+                    raise LLMError("structured output requested but none returned", cost_usd=cost) from exc
         usage = out.get("usage") or {}
         return LLMResult(
             text=text,
             data=data,
-            cost_usd=float(out.get("total_cost_usd") or 0.0),
+            cost_usd=cost,
             input_tokens=int(usage.get("input_tokens", 0))
             + int(usage.get("cache_creation_input_tokens", 0))
             + int(usage.get("cache_read_input_tokens", 0)),

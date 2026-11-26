@@ -28,6 +28,7 @@ MAX_EXCERPT_CHARS = 2000
 
 _TAG = re.compile(r"<[^>]+>")
 _SPACE = re.compile(r"\s+")
+_FENCE = re.compile(r"</?\s*signal\b", re.IGNORECASE)  # the prompt's own fence; never let data forge it
 
 
 def clean_text(raw: str | None, limit: int = MAX_EXCERPT_CHARS) -> str:
@@ -35,6 +36,7 @@ def clean_text(raw: str | None, limit: int = MAX_EXCERPT_CHARS) -> str:
     if not raw:
         return ""
     text = html.unescape(_TAG.sub(" ", raw.replace("<p>", "\n")))
+    text = _FENCE.sub(" ", text)  # entities decode after tags are stripped, so `&lt;/signal&gt;` would get through
     text = _SPACE.sub(" ", text).strip()
     return text[:limit]
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,7 +19,15 @@ from inventor.observe import Tracer
 
 
 class LLMError(RuntimeError):
-    """The model call failed or returned something unusable."""
+    """The model call failed or returned something unusable.
+
+    `cost_usd` is what the failed call was still billed (a truncated or refused
+    response costs money), so the budget can count it.
+    """
+
+    def __init__(self, message: str, cost_usd: float = 0.0) -> None:
+        super().__init__(message)
+        self.cost_usd = cost_usd
 
 
 class BudgetExceeded(RuntimeError):
@@ -65,9 +74,9 @@ class Budget:
         if self.spent_usd >= self.max_usd:
             raise BudgetExceeded(f"spend cap reached (${self.spent_usd:.4f}/${self.max_usd:.2f})")
 
-    def record(self, result: LLMResult) -> None:
+    def record(self, cost_usd: float) -> None:
         self.calls += 1
-        self.spent_usd += result.cost_usd
+        self.spent_usd += cost_usd
 
 
 @dataclass
@@ -97,28 +106,48 @@ class LLMClient:
 
     async def complete(self, request: LLMRequest, name: str = "llm") -> LLMResult:
         path = self.cache_dir / f"{self._key(request)}.json" if self.cache_dir else None
-        cached = path is not None and path.exists()
+        stored = _read_cache(path)
+        cached = stored is not None
         with self.tracer.span(name, as_type="generation", model=request.model,
                               input={"system": request.system, "prompt": request.prompt},
                               metadata={"backend": self.backend.name, "cached": cached}) as gen:
             if cached:
                 self.cache_hits += 1
-                stored = {k: v for k, v in json.loads(path.read_text()).items()
-                          if k not in ("trace_id", "observation_id")}
                 result = LLMResult(**{**stored, "cost_usd": 0.0, "cached": True})
             else:
                 async with self._sem:
                     self.budget.check()
                     try:
                         result = await self.backend.complete(request)
+                        if request.schema is not None and not isinstance(result.data, dict):
+                            raise LLMError("structured output is not a JSON object", cost_usd=result.cost_usd)
                     except LLMError as exc:
+                        self.budget.record(exc.cost_usd)
                         gen.update(level="ERROR", status_message=str(exc)[:500])
                         raise
-                    self.budget.record(result)
+                    self.budget.record(result.cost_usd)
                 if path is not None:
-                    path.write_text(json.dumps(asdict(result)))
+                    _write_cache(path, result)
             gen.update(output=result.data if result.data is not None else result.text,
                        usage_details={"input": result.input_tokens, "output": result.output_tokens},
                        cost_details={"total": result.cost_usd})
             result.trace_id, result.observation_id = gen.trace_id, gen.id
         return result
+
+
+def _read_cache(path: Path | None) -> dict | None:
+    """A cached result, or None on a miss. An unreadable entry counts as a miss."""
+    if path is None or not path.exists():
+        return None
+    try:
+        stored = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return {k: v for k, v in stored.items() if k not in ("trace_id", "observation_id")}
+
+
+def _write_cache(path: Path, result: LLMResult) -> None:
+    """Write then rename, so an interrupted write never leaves a half entry behind."""
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(asdict(result)))
+    os.replace(tmp, path)

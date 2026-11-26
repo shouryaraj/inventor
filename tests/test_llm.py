@@ -89,3 +89,63 @@ def test_anthropic_backend_refusal_raises():
     backend = AnthropicAPIBackend(client=NS(messages=_Messages(_response("", stop="refusal"))))
     with pytest.raises(LLMError):
         asyncio.run(backend.complete(LLMRequest(system="s", prompt="p", model="claude-haiku-5-5")))
+
+
+class _Usage:
+    input_tokens, output_tokens = 1000, 2000
+
+
+class _ScriptedResponse:
+    def __init__(self, stop_reason, text='{"ok": 1}'):
+        self.stop_reason, self.usage = stop_reason, _Usage()
+        self.content = [type("Block", (), {"type": "text", "text": text})()]
+
+
+class _ScriptedMessages:
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    async def create(self, **_):
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def _api(outcome):
+    return AnthropicAPIBackend(client=type("C", (), {"messages": _ScriptedMessages(outcome)})(),
+                               prices_per_mtok={"haiku": (1.0, 1.0)})
+
+
+def test_billed_failures_count_against_the_budget():
+    client = LLMClient(_api(_ScriptedResponse("max_tokens")), Budget(1.0, 10))
+    with pytest.raises(LLMError, match="truncated"):
+        asyncio.run(client.complete(REQ))
+    assert client.budget.calls == 1 and client.budget.spent_usd == pytest.approx(0.003)
+
+
+def test_sdk_errors_become_llm_errors():
+    class APIConnectionError(Exception):  # stands in for anthropic.APIError, which CI does not install
+        pass
+
+    backend = _api(APIConnectionError("connection reset"))
+    backend._api_errors = (APIConnectionError,)
+    with pytest.raises(LLMError, match="APIConnectionError: connection reset"):
+        asyncio.run(backend.complete(REQ))
+
+
+def test_non_object_structured_output_is_an_error():
+    from conftest import FakeBackend
+
+    client = LLMClient(FakeBackend(lambda r: ["not", "an", "object"]), Budget(1.0, 10))
+    with pytest.raises(LLMError, match="not a JSON object"):
+        asyncio.run(client.complete(REQ))
+    assert client.budget.calls == 1
+
+
+def test_corrupt_cache_entry_is_a_miss(fake_claude, tmp_path):
+    exe, calls = fake_claude
+    client = LLMClient(ClaudeCLIBackend(exe), Budget(1.0, 10), cache_dir=tmp_path / "cache")
+    (tmp_path / "cache" / f"{client._key(REQ)}.json").write_text('{"text": "half wri')
+    assert not asyncio.run(client.complete(REQ)).cached
+    assert asyncio.run(client.complete(REQ)).cached
+    assert not list((tmp_path / "cache").glob("*.tmp"))
