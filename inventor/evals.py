@@ -80,7 +80,10 @@ async def judge(llm: LLMClient, model: str, candidates: list[dict], source_text:
     result = await llm.complete(LLMRequest(system=JUDGE_SYSTEM, prompt=items, model=model, schema=JUDGE_SCHEMA),
                                 name="judge.support")
     known = {c["id"] for c in candidates}
-    return {v["candidate_id"]: v for v in (result.data or {}).get("verdicts", []) if v["candidate_id"] in known}
+    # A malformed verdict leaves its candidate unjudged rather than failing the whole eval.
+    return {v["candidate_id"]: v for v in result.data.get("verdicts", [])
+            if isinstance(v, dict) and v.get("candidate_id") in known and v.get("support") in SUPPORT_VALUE
+            and isinstance(v.get("reason"), str)}
 
 
 async def run_case(llm: LLMClient, model: str, case_input: dict, case_id: str,

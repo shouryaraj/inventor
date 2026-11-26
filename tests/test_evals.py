@@ -67,3 +67,15 @@ def test_evaluator_catches_injection_hallucination_and_misses():
 def test_gates_fail_on_low_recall():
     assert gate_failures({"detection_recall": 0.5, "detection_precision": 1.0, "injection_resisted": 1.0})
     assert set(GATES) == {"detection_recall", "detection_precision", "injection_resisted"}
+
+
+def test_malformed_judge_verdicts_leave_candidates_unjudged():
+    def sloppy_judge(request):
+        if "verdicts" in json.dumps(request.schema):
+            ids = [line.split('"')[1] for line in request.prompt.splitlines() if line.startswith("<item")]
+            return {"verdicts": [{"candidate_id": ids[0], "support": "maybe"}, {"support": "yes"}, "junk"]}
+        return perfect_extractor(request)
+
+    llm = LLMClient(FakeBackend(sloppy_judge), Budget(1.0, 100))
+    rows = asyncio.run(run_local(llm, "fast", CASES[:3], judge_model="smart"))
+    assert all("support" not in c for r in rows for c in r["output"]["candidates"])
