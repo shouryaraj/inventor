@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
 from inventor.cluster import ClusterStats, Group, cluster
 from inventor.health import Check, checks, metrics
@@ -27,6 +29,12 @@ from inventor.sources.base import now_utc
 from inventor.verify import quote_in_text
 
 SEEDS_DIR = Path(__file__).parent / "seeds"
+_QUERY_STRING = re.compile(r"\?[^\s'\"]*")
+
+
+def redact(message: str) -> str:
+    """Drop URL query strings from an error message: they can hold API keys (OpenAlex takes one there)."""
+    return _QUERY_STRING.sub("?…", message)
 
 
 @dataclass
@@ -79,9 +87,10 @@ async def harvest(cfg: RunConfig, client: httpx.AsyncClient, stats: RunStats, tr
             with tracer.span(f"search.{name}", as_type="retriever", input={"query": query}) as span:
                 try:
                     found = await source.search(query, cfg.limit_per_query)
-                except httpx.HTTPError as exc:
-                    stats.harvest_errors.append(f"{name} {query!r}: {exc}")
-                    span.update(level="ERROR", status_message=str(exc)[:500])
+                except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:  # network, bad JSON, odd records
+                    message = redact(f"{type(exc).__name__}: {exc}")
+                    stats.harvest_errors.append(f"{name} {query!r}: {message}")
+                    span.update(level="ERROR", status_message=message[:500])
                     continue
                 span.update(output={"signals": len(found), "urls": [s.url for s in found]})
             for s in found:
@@ -96,8 +105,11 @@ def check_candidates(items: list[dict], batch: list[Signal], first_index: int) -
     by_id = {s.id: s for s in batch}
     out = []
     for item in items:
-        c = ProblemCandidate(id=f"c{first_index + len(out):04d}", **{
-            **item, "lenses": [lens for lens in item.get("lenses", []) if lens in LENSES]})
+        try:
+            c = ProblemCandidate(id=f"c{first_index + len(out):04d}", **{
+                **item, "lenses": [lens for lens in item.get("lenses", []) if lens in LENSES]})
+        except (ValidationError, TypeError, AttributeError) as exc:
+            raise LLMError(f"model output did not match the extraction schema: {str(exc)[:300]}") from exc
         signal = by_id.get(c.signal_id)
         if signal is None:
             c.reject_reason = "unknown_signal"
@@ -188,13 +200,25 @@ def build_problems(groups: list[Group], verified: list[ProblemCandidate], signal
     return problems
 
 
+def new_run_dir(out_dir: Path, name: str) -> Path:
+    """A fresh directory; a second run in the same second gets a suffix instead of overwriting the first."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 1000):
+        path = out_dir / (name if n == 1 else f"{name}-{n}")
+        try:
+            path.mkdir()
+        except FileExistsError:
+            continue
+        return path
+    raise RuntimeError(f"too many runs named {name!r} in {out_dir}")
+
+
 async def run(cfg: RunConfig, llm: LLMClient, transport: httpx.AsyncBaseTransport | None = None,
               now: datetime | None = None) -> RunResult:
     from inventor.report import write_report
 
     now = now or now_utc()
-    run_dir = cfg.out_dir / f"{cfg.seed.name}-{now.strftime('%Y%m%dT%H%M%SZ')}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = new_run_dir(cfg.out_dir, f"{cfg.seed.name}-{now.strftime('%Y%m%dT%H%M%SZ')}")
     stats = RunStats()
     models = MODELS[cfg.backend]
     tracer = llm.tracer

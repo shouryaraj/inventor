@@ -26,12 +26,16 @@ class AnthropicAPIBackend:
     name = "anthropic-api"
 
     def __init__(self, client: Any = None, prices_per_mtok: dict[str, tuple[float, float]] | None = None) -> None:
-        if client is None:
-            try:
-                from anthropic import AsyncAnthropic
-            except ImportError as exc:
+        try:
+            import anthropic
+        except ImportError as exc:
+            if client is None:
                 raise LLMError("the anthropic-api backend needs: pip install 'inventor[api]'") from exc
-            client = AsyncAnthropic()  # credentials from ANTHROPIC_API_KEY or an `ant auth login` profile
+            self._api_errors: tuple[type[BaseException], ...] = ()
+        else:
+            self._api_errors = (anthropic.APIError,)
+            if client is None:
+                client = anthropic.AsyncAnthropic()  # credentials from ANTHROPIC_API_KEY or an `ant auth login` profile
         self.client = client
         self.prices = prices_per_mtok or DEFAULT_PRICES_PER_MTOK
 
@@ -48,11 +52,19 @@ class AnthropicAPIBackend:
         }
         if request.schema is not None:
             kwargs["output_config"] = {"format": {"type": "json_schema", "schema": request.schema}}
-        response = await self.client.messages.create(**kwargs)
+        try:
+            response = await self.client.messages.create(**kwargs)
+        except self._api_errors as exc:
+            raise LLMError(f"Anthropic API error: {type(exc).__name__}: {str(exc)[:300]}") from exc
+        usage = response.usage
+        input_tokens = (usage.input_tokens or 0) + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        input_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
+        output_tokens = usage.output_tokens or 0
+        cost = self._cost(request.model, input_tokens, output_tokens)  # billed even if the answer is unusable
         if response.stop_reason == "refusal":
-            raise LLMError("the model declined this request")
+            raise LLMError("the model declined this request", cost_usd=cost)
         if response.stop_reason == "max_tokens":
-            raise LLMError("response truncated at max_tokens")
+            raise LLMError("response truncated at max_tokens", cost_usd=cost)
 
         text = next((b.text for b in response.content if b.type == "text"), "")
         data = None
@@ -60,14 +72,5 @@ class AnthropicAPIBackend:
             try:
                 data = json.loads(text)
             except json.JSONDecodeError as exc:
-                raise LLMError("structured output was not valid JSON") from exc
-        usage = response.usage
-        input_tokens = (usage.input_tokens or 0) + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
-        input_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
-        return LLMResult(
-            text=text,
-            data=data,
-            cost_usd=self._cost(request.model, input_tokens, usage.output_tokens or 0),
-            input_tokens=input_tokens,
-            output_tokens=usage.output_tokens or 0,
-        )
+                raise LLMError("structured output was not valid JSON", cost_usd=cost) from exc
+        return LLMResult(text=text, data=data, cost_usd=cost, input_tokens=input_tokens, output_tokens=output_tokens)
