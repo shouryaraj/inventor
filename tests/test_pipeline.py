@@ -7,6 +7,7 @@ from conftest import FakeBackend, json_transport
 
 from inventor.llm import Budget, LLMClient
 from inventor.pipeline import RunConfig, Seed, redact, run
+from inventor.sources.base import Source
 
 HN = {"hits": [
     {"objectID": "1",
@@ -67,6 +68,7 @@ def test_budget_exhaustion_gives_partial_run_not_crash(tmp_path):
 
 def test_harvest_errors_never_include_query_strings(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENALEX_API_KEY", "SECRET123")
+    monkeypatch.setattr(Source, "backoff_s", 0)
     cfg = RunConfig(seed=Seed("test", "", {"openalex": ["greenhouse"]}), sources=["openalex"], out_dir=tmp_path)
     transport = httpx.MockTransport(lambda request: httpx.Response(500, request=request))
     result = asyncio.run(run(cfg, LLMClient(FakeBackend(respond), Budget(1.0, 10)), transport=transport))

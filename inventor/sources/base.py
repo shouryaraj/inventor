@@ -25,6 +25,7 @@ from inventor.models import Signal, SourceKind
 
 USER_AGENT = f"inventor/{__version__} (open-source problem finder)"
 MAX_EXCERPT_CHARS = 2000
+MAX_RETRY_WAIT_S = 60.0
 
 _TAG = re.compile(r"<[^>]+>")
 _SPACE = re.compile(r"\s+")
@@ -59,6 +60,8 @@ class Source:
     name: ClassVar[str]
     kind: ClassVar[SourceKind]
     min_interval_s: ClassVar[float] = 1.0  # politeness floor between requests
+    max_attempts: ClassVar[int] = 3
+    backoff_s: ClassVar[float] = 2.0         # first retry wait when the server gives none; doubles each time
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self.client = client
@@ -74,20 +77,49 @@ class Source:
 
     async def get_json(self, url: str, params: dict[str, Any] | None = None,
                        headers: dict[str, str] | None = None) -> Any:
-        """GET with a per-source rate limit and one polite retry on HTTP 429."""
-        for attempt in range(2):
+        """GET with a per-source rate limit and polite retries.
+
+        Retries rate limiting (429, or GitHub's 403 with no requests left), server
+        errors (5xx) and dropped connections, waiting as long as the server asks
+        (Retry-After or the rate-limit reset time) or backing off exponentially,
+        never more than MAX_RETRY_WAIT_S at a time.
+        """
+        for attempt in range(1, self.max_attempts + 1):
             async with self._lock:
                 wait = self.min_interval_s - (time.monotonic() - self._last)
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self._last = time.monotonic()
-                resp = await self.client.get(url, params=params, headers=headers)
-            if resp.status_code == 429 and attempt == 0:
-                await asyncio.sleep(min(float(resp.headers.get("retry-after", 10)), 60))
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        resp.raise_for_status()  # pragma: no cover - loop always returns or raises
+                try:
+                    resp = await self.client.get(url, params=params, headers=headers)
+                except httpx.TransportError:
+                    if attempt == self.max_attempts:
+                        raise
+                    resp = None
+            if resp is not None and not _retryable(resp):
+                resp.raise_for_status()
+                return resp.json()
+            if attempt == self.max_attempts:
+                resp.raise_for_status()
+            await asyncio.sleep(_retry_wait(resp, self.backoff_s * 2 ** (attempt - 1)))
+        raise AssertionError("unreachable")  # pragma: no cover - the last attempt returns or raises
+
+
+def _retryable(resp: httpx.Response) -> bool:
+    if resp.status_code == 429 or resp.status_code >= 500:
+        return True
+    return resp.status_code == 403 and resp.headers.get("x-ratelimit-remaining") == "0"
+
+
+def _retry_wait(resp: httpx.Response | None, backoff_s: float) -> float:
+    """Seconds to wait before retrying: what the server asked for, else the backoff."""
+    wait = backoff_s
+    if resp is not None:
+        if (after := resp.headers.get("retry-after", "")).isdigit():
+            wait = float(after)
+        elif (reset := resp.headers.get("x-ratelimit-reset", "")).isdigit():
+            wait = max(float(reset) - time.time(), 0.0) + 1.0
+    return min(wait, MAX_RETRY_WAIT_S)
 
 
 SOURCES: dict[str, type[Source]] = {}

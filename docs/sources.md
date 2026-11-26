@@ -1,8 +1,10 @@
 # Sources: access, limits, terms
 
 Inventor uses only documented public APIs, identifies itself with a User-Agent, spaces its
-requests (`min_interval_s` per source), retries once on HTTP 429, keeps excerpts (≤ 2,000
-characters) rather than full documents, and never stores author names.
+requests (`min_interval_s` per source), retries rate limits (429, GitHub's 403 with no requests
+left), server errors and dropped connections up to 3 attempts (waiting as long as the server
+asks, at most 60 s), keeps excerpts (≤ 2,000 characters) rather than full documents, and never
+stores author names.
 
 | Source | Endpoint | Auth | Limits we respect | Terms |
 |---|---|---|---|---|
